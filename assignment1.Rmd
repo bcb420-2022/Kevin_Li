@@ -1,0 +1,362 @@
+---
+title: 'Assignment 1: Data set selection and initial Processing.'
+output:
+  html_document:
+    df_print: paged
+    toc: true
+---
+
+\* "Run current chunk" does not seem to work on my docker image's R, may have to run line by line. However, knitting to HTML works as prior to submission.
+
+## Data set selection
+
+GEOmetadb is installed through Bioconductor in order to prune and select a suitable data set. The following code segment(s) essential to data set selection and database queries are adapted from the lecture slides.
+
+```{r message=FALSE, warning=FALSE}
+# Check for installations of packages and its prerequisite
+if(!requireNamespace("BiocManager", quietly = TRUE)){
+  install.packages("BiocManager")
+}
+if(!requireNamespace("GEOmetadb", quietly = TRUE)){
+  BiocManager::install("GEOmetadb")
+}
+if(!requireNamespace("edgeR", quietly = TRUE)){
+  BiocManager::install("edgeR")
+}
+if(!requireNamespace("HGNChelper", quietly = TRUE)){
+  install.packages("HGNChelper")
+}
+# Load the packages
+library("BiocManager")
+library("GEOmetadb")
+library("edgeR")
+library("HGNChelper")
+# Retrieve GEOmetadb SQLite file
+if(!file.exists("GEOmetadb.sqlite")){
+  getSQLiteFile()
+}
+```
+
+We should be able to connect the GEO meta database now.
+
+```{r}
+con <- dbConnect(SQLite(),'GEOmetadb.sqlite')
+geo_tables <- dbListTables(con)
+```
+
+To select for a desired expression data set, we should keep these requirements in mind:
+
+1.  Good coverage
+
+2.  Published in the recent decade
+
+3.  Sufficient numbers of replicates
+
+4.  Collected under interesting conditions
+
+5.  Mapped to unique human gene identifier
+
+6.  \*Has counts supplementary files
+
+We can begin by querying our database with the following query:
+
+```{r}
+# Select data set within recent 10 years, related to epigenetics(data set of interest), mapped to human gene.
+sql_query <- paste(
+  "SELECT DISTINCT gse.title,gse.gse, gpl.title,",
+  " gse.submission_date,",
+  " gse.supplementary_file",
+  "FROM",
+  " gse JOIN gse_gpl ON gse_gpl.gse=gse.gse",
+  " JOIN gpl ON gse_gpl.gpl=gpl.gpl",
+  "WHERE",
+  " gse.submission_date > '2012-02-14' AND",
+  " gse.title LIKE '%epigenetic%' AND",
+  " gpl.organism LIKE '%Homo sapiens%' AND",
+  " gpl.technology LIKE '%high-throughput sequencing%' ",
+  " ORDER BY gse.submission_date DESC",
+  sep = " "
+)
+
+res <- dbGetQuery(con,sql_query)
+
+# Get all results with supplementary files and store it
+sup_files <- unlist(lapply(
+  res$supplementary_file,
+  FUN = function(x) {
+    x <- unlist(strsplit(x, ";"))
+    
+    x <- x[grep(x, pattern = "txt", ignore.case = TRUE)]
+    
+    tail(unlist(strsplit(x, "/")), n = 1)
+  }
+))
+
+# Filter out results with counts files
+counts_files <- sup_files[grep(sup_files, pattern = "count", ignore.case = TRUE)]
+```
+
+#### Data of interest
+
+There are many results that can be inquired further with the accession code, one with particular interest was found: GSE124252. We can start obtaining the raw counts data as well as information regarding the platform
+
+```{r message=FALSE, warning=FALSE}
+# Obtain and store supplement files
+geo_sup_files <- getGEOSuppFiles("GSE124252")
+geo_file_names <- rownames(geo_sup_files)
+epi_raw_data <- read.delim(geo_file_names[2], header=TRUE)
+head(epi_raw_data)
+```
+
+```{r message=FALSE, warning=FALSE}
+# Obtain platform and experiment data
+gse <- getGEO("GSE124252", GSEMatrix = FALSE)
+gse_meta <- Meta(gse)
+gpl_meta <- Meta(getGEO(names(GPLList(gse)[1])))
+```
+
+### Platform information - GPL11154
+
+**Platform Title**: `r gpl_meta$title`
+
+**Submission data**: `r gpl_meta$submission_date`
+
+**Last update data**: `r gpl_meta$last_update_date`
+
+**Organisms**: `r gpl_meta$organism` (taxid: `r gpl_meta$taxid`)
+
+**Number of GEO datasets that use this technology**: `r length(gpl_meta$series_id)`
+
+**Number of GEO samples that use this technology**: `r length(gpl_meta$sample_id)`
+
+#### Experimental conditions
+
+The control of the data set is measured for normal human retinal cells, the test condition for this experiment is to explore the relationship between the accelerated aging of Trisomy 13 and Trisomy 21 epigenetic clock and the acceleration of their developmental clock.
+
+### HUGO mapping
+
+We stored the raw counts data to the variable `epi_raw_data`, immediately we could see that our supplementary file contains a column named "x" that contains HGNC symbols for each row.
+
+#### Non-approved HUGO symbols
+
+There are symbols that are not approved and without any alternative suggested symbols, we can remove them since there are very few of such cases. For other outdated/deprecated symbols that has a new symbol name, we can replace them with the help of "HGNChelper" package.
+
+#### Unique mapping
+
+After replacing symbols with outdated/non-existant symbol names, some symbols returned by the HGNChelper package might give multiple suggested symbols alternative separated by 3 forward dashes. This means it will have duplicated mappings where multiple genes will map to the same gene, in such cases we remove them since there are very little countable cases that would affect our result.
+
+```{r message=FALSE, warning=FALSE}
+# Check all symbols if they're approved
+checked_symbols <- checkGeneSymbols(epi_raw_data$X)
+
+checked_symbols$Suggested.Symbol <- gsub(" ///.*", "", checked_symbols$Suggested.Symbol)
+
+# Getting ready to replace non-approved gene symbols with suggested symbols(alternative names)
+to_replace <- which(checked_symbols$Approved == FALSE & !is.na(checked_symbols$Suggested.Symbol))
+
+# Replace symbols with suggested alternative symbol name
+for(i in 1:length(to_replace)){
+  epi_raw_data$X[to_replace[i]] <- checked_symbols$Suggested.Symbol[to_replace[i]]
+}
+
+# Remove symbols with no alternative symbol names given by HGNC
+epi_raw_data <- epi_raw_data[-which(checked_symbols$Approved == FALSE & is.na(checked_symbols$Suggested.Symbol)),]
+
+# We should have all approved symbols at this point
+checked_symbols <- checkGeneSymbols(epi_raw_data$X)
+
+# We remove duplicate symbols
+epi_raw_data <- subset(epi_raw_data, !duplicated(epi_raw_data$X))
+```
+
+Now we could clean up the data and set the symbols as row names
+
+```{r}
+epi_data <- epi_raw_data[,2:ncol(epi_raw_data)]
+rownames(epi_data) <- epi_raw_data$X
+head(epi_data)
+```
+
+### Further data cleaning
+
+Currently, we are working with \~24000 symbols, some of which are "outliers" in my perspective, where their expression values are consistently low in all other samples measured. Thus, I think it is better if we were to exclude these outliers based on their accumulative combined score in all samples, and does not have a score above a threshold in a single column(edgeR).
+
+```{r message=FALSE, warning=FALSE}
+# edgeR protocol exclusion of data
+cpms <- cpm(epi_data)
+total_threshold <- ncol(epi_data)
+
+keep <- rowSums(cpms > 1) >= total_threshold
+epi_data_filtered <- epi_data[keep,]
+```
+
+#### Number of removed outliers
+
+Symbols whose scores are consistently low in each sample or they do not express highly in any other columns were excluded in accordance to edgeR. After removing the outliers, `r nrow(epi_data) - nrow(epi_data_filtered)` symbols were excluded in our filtered data set.
+
+At this point we should've done 2 duplicate checking, one before removing outliers and one after. However, our given data set all maps to unique symbols, it is guaranteed that there would be no duplicates. In other words, all expression values are unique for their respective unique genes.
+
+## Normalization
+
+In order to apply normalization on our data set, it is important to find a suitable normalization method for our data set, we would begin by plotting our data set of different plots.
+
+### Box plot
+
+Many of the plots and its respective codes are adapted from lecture 4's slides.
+
+We should apply log2 transformation on cpm of our data and plot.
+
+```{r}
+epi_plot_data <- log2(cpm(epi_data_filtered))
+
+# log2 of 0 would yield Inf values, we would want to remove those before plotting:
+# To check:
+# any(is.infinite(epi_plot_data))
+# However, we don't have any Inf values, in the case we do we can run the following:
+# epi_plot_data <- subset(epi_plot_data, !(rownames(epi_plot_data) %in% names(which(rowSums(is.infinite(epi_plot_data) == TRUE)>=1))))
+
+boxplot(epi_plot_data, xlab="Samples", ylab="log2 CPM",
+        las=2,cex=0.5,cex.lab=0.5,cex.axis=0.5, main="Retinal RNASeq Samples")
+abline(h=median(apply(epi_plot_data, 2, median)), col="red", lwd= 0.8, lty="dashed")
+
+```
+
+The median of all columns seems to align with the median of each boxes.
+
+### Density plot
+
+```{r}
+# Adapted from lecture 4's slides
+
+# Calculate density
+counts_dens <- apply(log2(cpm(epi_data_filtered)), 2, density)
+
+# Calculate limits
+xlim <- 0; ylim <- 0
+for(i in 1:length(counts_dens)){
+  xlim <- range(c(xlim, counts_dens[[i]]$x))
+  ylim <- range(c(ylim, counts_dens[[i]]$y))
+}
+cols <- rainbow(length(counts_dens))
+ltys <- rep(1, length(counts_dens))
+
+# Initalize plot
+plot(counts_dens[[1]], xlim=xlim, ylim=ylim, type="n", ylab="Smoothing density of log2-CPM", main="Retinal RNASeq Samples", cex.lab=0.8)
+
+# Graph lines
+for(i in 1:length(counts_dens)){
+  lines(counts_dens[[i]], col=cols[i])
+}
+
+# Create legend
+legend("topright", colnames(epi_plot_data),
+       col=cols, lty=ltys, cex=0.75,
+       border ="blue", text.col = "green4",
+       merge = TRUE, bg = "gray90")
+```
+
+### TMM
+
+TMM normalization seems to be a suitable choice for applying normalization to our data set, from the published paper, we know that genes are not differentially expressed; we also want to calculate the normalization across samples.
+
+```{r}
+# Create edgeR container
+filtered_matrix <- as.matrix(epi_data_filtered)
+d <- DGEList(counts=filtered_matrix, group=colnames(epi_data_filtered))
+# Calculate normalization factor
+d <- calcNormFactors(d)
+# Store normalized data based on cpm
+norm_counts <- cpm(d)
+```
+
+#### Normalized box plot
+
+```{r message=FALSE, warning=FALSE}
+boxplot(log2(norm_counts), xlab="Samples", ylab="log2 CPM",
+        las=2,cex=0.5,cex.lab=0.5,cex.axis=0.5, main="Normalized Retinal RNASeq Samples")
+
+abline(h=median(apply(log2(norm_counts), 2, median)), col="red", lwd= 0.8, lty="dashed")
+```
+
+Immediately, when comparing the previous box plot and the new one, we can see that the normalized box plot's median line is much more aligned with each sample's median.
+
+#### Normalized density plot
+
+```{r message=FALSE, warning=FALSE}
+# Adapted from lecture 4's slides
+
+# Calculate density
+counts_dens <- apply(log2(norm_counts), 2, density)
+
+# Calculate limits
+xlim <- 0; ylim <- 0
+for(i in 1:length(counts_dens)){
+  xlim <- range(c(xlim, counts_dens[[i]]$x))
+  ylim <- range(c(ylim, counts_dens[[i]]$y))
+}
+cols <- rainbow(length(counts_dens))
+ltys <- rep(1, length(counts_dens))
+
+# Initalize plot
+plot(counts_dens[[1]], xlim=xlim, ylim=ylim, type="n", ylab="Smoothing density of log2-CPM", main="Normalized Retinal RNASeq Samples", cex.lab=0.8)
+
+# Graph lines
+for(i in 1:length(counts_dens)){
+  lines(counts_dens[[i]], col=cols[i])
+}
+
+# Create legend
+legend("topright", colnames(epi_plot_data),
+       col=cols, lty=ltys, cex=0.75,
+       border ="blue", text.col = "green4",
+       merge = TRUE, bg = "gray90")
+```
+
+### MDS plot
+
+```{r message=FALSE, warning=FALSE}
+samples <- data.frame(
+  lapply(colnames(epi_data_filtered), FUN=function(x){
+    unlist(strsplit(x, split="\\_"))[c(2,3)]
+  }
+))
+colnames(samples) <- colnames(epi_data_filtered)
+rownames(samples) <- c("sample_number", "cell_type")
+plotMDS(d,
+        labels=samples[2,],
+        col = rainbow(length(levels(factor(samples[1,]))), alpha=1)[factor(samples[1,])], main="MDS plot of Norm. Retinal RNASeq Samples")
+```
+
+# Interpret+document
+
+### What are the control and test conditions of the dataset?
+
+The control of the data set is measured for normal human retinal cells, the test condition for this experiment is to explore the relationship between the accelerated aging of Trisomy 13 and Trisomy 21 retinal cell's epigenetic clock and the acceleration of their developmental clock.
+
+### Why is the dataset of interest to you?
+
+Data sets regarding epigenetics are of interest to me since it was a topic that I've done in a previous bioinformatic course, it explores the developmental side of biology as well as how different types of cells interact with our gene(eg. pluripotent cells).
+
+### Were there expression values that were not unique for specific genes? How did you handle these?
+
+Yes, when checking and validating all symbols to be valid, approved HUGO symbols, alternative/suggested symbols were returned by the package HGNChelper. The alternative symbols would often have pre-existing expression values mapped to it, because there are such few cases, removing it will barely affect the result in any significant way.
+
+### Were there expression values that could not be mapped to current HUGO symbols?
+
+Yes, there were expression values that could not be mapped to an approved/current HUGO symbol. Because there are such few cases, I removed them with the help of the package HGNChelper, this will barely affect the result in any significant way.
+
+### How many outliers were removed?
+
+`r nrow(epi_data) - nrow(epi_data_filtered)` outliers were removed during processing and filtering, they were either non-unique mappings of expression values, or not in accordance to edgeR protocol.
+
+### How did you handle replicates?
+
+Replicates datas were normalized with TMM such that expression values are normalized across each samples.
+
+### What is the final coverage of your dataset?
+
+`r nrow(norm_counts)` is the final coverage of the data set. `r 100*nrow(norm_counts)/nrow(read.delim(geo_file_names[2], header=TRUE))`% of the original raw counts data is covered
+
+# Reference
+
+Hoshino, Akina et al. "Synchrony and asynchrony between an epigenetic clock and developmental timing." Scientific reports vol. 9,1 3770. 6 Mar. 2019, <doi:10.1038/s41598-019-39919-3>
