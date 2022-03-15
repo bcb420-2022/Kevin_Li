@@ -1,0 +1,290 @@
+---
+title: 'Assignment 2: Differential Gene expression and Preliminary ORA'
+output:
+  html_document:
+    df_print: paged
+    toc: yes
+  pdf_document:
+    toc: yes
+bibliography: references.bib
+---
+
+\* "Run current chunk" does not seem to work on my docker image's R, may have to run line by line. However, knitting to HTML works as prior to submission.
+
+```{r message=FALSE, warning=FALSE}
+# Libraries
+library("edgeR")
+library("knitr")
+library("Biobase")
+library("limma")
+
+# Libraries for plot
+library("ggplot2")
+library(reshape2)
+library("ggrepel")
+library("ComplexHeatmap")
+library(circlize)
+
+library(gprofiler2)
+```
+
+## Differential Gene Expression
+
+Using data from Assignment #1, however I was unable to source A1 as a child document, therefore saveRDS() is used to save the normalized data for consequent uses:
+
+```{r eval=TRUE, message=FALSE, warning=FALSE, include=TRUE}
+# This will save the normalized data to a loadable R object
+# saveRDS(norm_counts, "norm_counts.rds")
+norm_counts <- readRDS("norm_counts.rds")
+kable(norm_counts[1:5,1:5])
+```
+
+Then using the normalized data, we can calculate p-values for each genes in the expression set, first we create a model design:
+
+```{r}
+# Create samples for model design
+samples <- data.frame(
+  lapply(colnames(norm_counts),
+         FUN=function(x){
+           unlist(strsplit(x,split="_"))[c(2)]
+         })
+)
+colnames(samples) <- colnames(norm_counts)
+rownames(samples) <- c("Samples")
+samples <- data.frame(t(samples))
+
+model_samp <- model.matrix(~samples$Samples)
+kable(model_samp[1:5,1:5])
+```
+
+I've created a model that accounts for sample variability, from samples 1-6, as well as human samples.
+
+```{r}
+# Create an expression data matrix for data fitting
+exp_matrix <- as.matrix(norm_counts)
+min_set <- ExpressionSet(assayData = exp_matrix)
+
+# Fit data using limma
+fit <- lmFit(min_set, model_samp)
+
+# Apply empirical Bayes for differential expression
+fit_emp <- eBayes(fit, trend=TRUE)
+fit_emp <- eBayes(fit)
+
+# Extract top-ranked genes
+top_fit <- topTable(fit_emp,
+                    coef = ncol(model_samp),
+                    adjust.method = "BH",
+                    number = nrow(exp_matrix))
+
+# Since I've already applied HGNC symbols to our data set as rownames previously
+# We can view p-values directly:
+output_pvalue <- top_fit[order(top_fit$P.Value),]
+```
+
+We've obtained p-values for each of the genes based on a model and fitting our normalized data with limma, thus we can inspect the following
+
+#### Genes, p-value \< 0.01
+
+```{r}
+length(which(output_pvalue$P.Value < 0.01))
+```
+
+`r length(which(output_pvalue$P.Value < 0.01))` genes were significantly expressed as compared to `r`nrow(norm_counts)\`
+
+#### Genes, adjusted p-value \< 0.01
+
+```{r}
+length(which(output_pvalue$adj.P.Val < 0.01))
+```
+
+When using the adjusted p-value, we can see that there are `r length(which(output_pvalue$adj.P.Val < 0.01))` genes that are significantly deferentially expressed.
+
+### How many genes were significantly differentially expressed? What thresholds did you use and why?
+
+A threshold of 0.01 was used to denote a 99% confidence, we want a small sample size of genes that are statistically significant for differentially expressed genes; when applying a p-value threshold of 0.05, there are 700 genes. With a smaller threshold we can be more confident that those genes are significantly differentially expressed, such is true for controlling FDR/adjusted p-value.
+
+### Which MHC method did you use? And Why? How many genes passed correction?
+
+Benjamini-Hochberg, or BH was used; it controls the false discovery rate (FDR), this means that false-positives or insignificant genes are controlled. This method is useful when we have large numbers of genes to be tested against, in our case the normalized gene counts started at \~12000 number of genes. When inspecting the adjusted p-value when a threshold of \<0.01 is applied, 6 genes passed correction. Thus these 6 genes will be shown and highlighted in the following plot:
+
+### Show differentially expressed genes with MA Plot or a Volcano plot. Highlight genes of interest.
+
+```{r}
+# Create Volcano plot
+plot_data <- cbind(gene=rownames(output_pvalue), output_pvalue)
+
+plot_labels <- plot_data[which(plot_data$adj.P.Val < 0.01),]
+
+ggplot(data = plot_data,
+       aes(y=-log10(adj.P.Val), x=logFC)) + 
+  geom_point() + 
+  geom_text_repel(
+    data=plot_data[which(plot_data$adj.P.Val < 0.01),],
+    aes(label=gene)) +
+  geom_point(data=plot_data[which(plot_data$adj.P.Val < 0.01),], color="red")
+```
+
+### Heatmap, does your conditions cluster together? Explain why or why not.
+
+```{r}
+# Original Heatmap
+heatmap_orig <- t(scale(t(norm_counts)))
+heatmap_col <- colorRamp2(
+  c(min(heatmap_orig),0,max(heatmap_orig)), 
+  c("blue", "white", "red"))
+orig_heatmap <- Heatmap(as.matrix(heatmap_orig),
+                        show_row_dend = TRUE,
+                        show_column_dend = TRUE,
+                        col=heatmap_col,
+                        show_column_names = TRUE,
+                        show_row_names = FALSE,
+                        show_heatmap_legend = TRUE)
+
+orig_heatmap
+```
+
+Then to compare the heatmap after limma:
+
+```{r}
+# Heatmap after limma
+top_genes <- output_pvalue[output_pvalue$P.Value<0.01,]
+heatmap_top <- t(scale(t(heatmap_orig[which(rownames(top_genes) %in% rownames(heatmap_orig)),])))
+heatmap_col2 <- colorRamp2(
+  c(min(heatmap_top),0,max(heatmap_top)), 
+  c("blue", "white", "red"))
+curr_heatmap <- Heatmap(as.matrix(heatmap_top),
+                        show_row_dend = TRUE,
+                        show_column_dend = FALSE,
+                        col=heatmap_col2,
+                        show_column_names = TRUE,
+                        show_row_names = FALSE,
+                        show_heatmap_legend = TRUE,
+                        cluster_columns = FALSE)
+curr_heatmap
+```
+
+Conditions cluster definitely changed, there are much more emphasis on genes that were previously to faint to notice; samples columns are also much more nuanced when displaying portion of genes that are insignificant.
+
+## Thresholded over-representation analysis
+
+```{r}
+# Create thresholded lists of genes
+output_hits <- output_pvalue
+output_hits[,"rank"] <- -log10(output_hits$P.Value) * sign(output_pvalue$logFC)
+output_hits <- output_hits[order(output_hits$rank),]
+
+upreg_genes <- rownames(output_hits[which(output_hits$P.Value < 0.01 & output_hits$logFC > 0),])
+downreg_genes <- rownames(output_hits[which(output_hits$P.Value < 0.01 & output_hits$logFC < 0),])
+
+write.table(x=upreg_genes, file=file.path("epi_upreg_genes.txt"), 
+            sep="\t",row.names = FALSE, col.names = FALSE, quote = FALSE)
+write.table(x=downreg_genes, file=file.path("epi_downreg_genes.txt"), 
+            sep="\t",row.names = FALSE, col.names = FALSE, quote = FALSE)
+
+```
+
+### Which method did you choose and why?
+
+g:profiler would be useful since it allows for simple ORA as well as multiple data sources. It also provides a library for R that allows for input and output interfacing.
+
+```{r eval=FALSE, message=FALSE}
+library(gprofiler2)
+```
+
+### What annotation data did you use and why? What version of the annotation are you using?
+
+<GO:BP> and Reactome was chosen as they are more general in terms of gene classification as compared to WikiPathways; also since we have a small list of downregulated genes it may be beneficial to exclude WikiPathways.
+
+The versions are:
+
+```{r}
+anno_version <- get_version_info(organism = "hsapiens")
+version_df <- data.frame(Tools=c("g:profiler",
+                                 anno_version$sources$`GO:BP`$name, 
+                                 anno_version$sources$REAC$name),
+           
+                         Version=c(anno_version$gprofiler_version,
+                     anno_version$sources$`GO:BP`$version,
+                     anno_version$sources$REAC$version))
+version_df
+```
+
+### How many genesets were returned with what thresholds?
+
+```{r}
+output_query <- gost(query = rownames(output_hits),
+                    organism = "hsapiens",
+                    ordered_query = FALSE,
+                    multi_query = FALSE,
+                    significant = FALSE,
+                    user_threshold = 0.01,
+                    correction_method = c("fdr"),
+                    domain_scope = c("annotated"),
+                    numeric_ns = "ENTREZGENE_ACC",
+                    sources = c("REAC", "GO:BP"))
+length(unique(output_query$result$term_id))
+```
+
+`r length(unique(output_query$result$term_id))` gene sets were returned when the entire gene list were queried based on their ranks, the threshold was set to 0.01 as configurated.
+
+### Run the analysis using the up-regulated set of genes, and the down-regulated set of genes separately. How do these results compare to using the whole list (i.e all differentially expressed genes together vs. the up-regulated and down regulated differentially expressed genes separately)?
+
+For upregulated genes query:
+
+```{r}
+upreg_query <- gost(query = upreg_genes,
+                    organism = "hsapiens",
+                    ordered_query = FALSE,
+                    multi_query = FALSE,
+                    significant = FALSE,
+                    user_threshold = 0.01,
+                    correction_method = c("fdr"),
+                    domain_scope = c("annotated"),
+                    numeric_ns = "ENTREZGENE_ACC",
+                    sources = c("REAC", "GO:BP"))
+length(unique(upreg_query$result$term_id))
+```
+
+`r length(unique(upreg_query$result$term_id))` genesets were returned for upregulated genes query.
+
+```{r}
+downreg_query <- gost(query = downreg_genes,
+                    organism = "hsapiens",
+                    ordered_query = FALSE,
+                    multi_query = FALSE,
+                    significant = FALSE,
+                    user_threshold = 0.01,
+                    correction_method = c("fdr"),
+                    domain_scope = c("annotated"),
+                    numeric_ns = "ENTREZGENE_ACC",
+                    sources = c("REAC", "GO:BP"))
+length(unique(downreg_query$result$term_id))
+```
+
+`r length(unique(downreg_query$result$term_id))` genesets were returned for downregulated genes query.
+
+There were significantly less results when compared to using the whole list as a query, there were one-fourth of the total results returned for both up/down-regulated gene queries.
+
+## Interpretation
+
+### Do the over-representation results support conclusions or mechanism discussed in the original paper?
+
+```{r}
+up_sorted <- upreg_query$result[order(upreg_query$result$p_value),]
+
+down_sorted <- downreg_query$result[order(downreg_query$result$p_value),]
+
+up_sorted <- up_sorted[which(up_sorted$significant == TRUE),]
+down_sorted <- down_sorted[which(down_sorted$significant == TRUE),]
+```
+
+When inspecting the ORA result from gprofiler query, the pathways and processes given were definitely some-what adhering to the mechanism described by the paper:
+
+The paper found \~3000 developmentally regulated genes that has meaningful expression on specifically tissues. As such, the top result from gprofiler when given an input list of upregulated genes, the term was "tissue development"; this adheres to the mechanism described in the discussion section of the paper where epigenetic clock can be used to study aging in developing tissue ( @hoshino2019 ).
+
+### Can you find evidence, i.e. publications, to support some of the results that you see. How does this evidence support your results.
+
+In a research, it is found that there is a positive correlation that epigenetic age acceleration suggests underlying tissue ages faster than expected chronological age ( @horvath2018 ), although the proposed mechanism and its associated genes that were involved in brain tissue aging were not found in the list of the input ORA gene queries, they're still associative in the pathways that they share which relates to tissue development.
+
+# Reference
